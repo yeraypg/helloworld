@@ -1,0 +1,89 @@
+pipeline {
+    agent { label 'git' }
+    environment {
+        VENV_PATH = "${WORKSPACE}/venv"
+        JAVA_HOME = "/opt/homebrew/opt/openjdk"
+        PATH = "${JAVA_HOME}/bin:${env.PATH}"
+    }
+
+    stages {
+        stage('Get code') {
+            agent { label 'git'}
+            steps {
+                echo 'Nos traemos el código'
+                git credentialsId: 'github', url: 'git@github.com:yeraypg/helloworld.git'
+                stash name: 'source-code', includes: '**/*'
+                sh 'ls'
+                echo "Directorio de trabajo: ${env.WORKSPACE}"
+            }
+        }
+
+        stage('Build') {
+            agent { label 'build'}
+            steps {
+                echo 'EN PYTHON NO SE COMPILA NADA'
+            }
+        }
+        stage('Tests') {
+            parallel {
+                stage('Unit') {
+                    agent { label 'test'}
+                    steps {
+                        unstash 'source-code'
+                        sh '''
+                            python3 -m venv venv
+                            ./venv/bin/pip install --upgrade pip
+                            ./venv/bin/pip install flask pytest requests
+                            PYTHONPATH=. ./venv/bin/pytest --junitxml=result-unit.xml test/unit
+                        '''
+                        stash name: 'unit-results', includes: 'result-unit.xml'
+                    }
+                }
+                stage('Rest') {
+                    agent { label 'test'}
+                    steps {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            unstash 'source-code'
+                            sh '''
+                            python3 -m venv venv
+                            ./venv/bin/pip install --upgrade pip
+                            ./venv/bin/pip install flask pytest requests
+            
+                            export FLASK_APP=app/api.py
+                            export FLASK_ENV=development
+            
+                            nohup ./venv/bin/flask run --host=localhost --port=5000 > flask.log 2>&1 &
+                            FLASK_PID=$!
+            
+                            nohup java -jar /Users/yeray/wiremock/wiremock.jar --port 9090 -v --root-dir ./test/wiremock > wiremock.log 2>&1 &
+                            WIREMOCK_PID=$!
+            
+                            echo "Esperando a que Flask y WireMock estén listos..."
+                            for i in {1..10}; do
+                                nc -z localhost 5000 && nc -z localhost 9090 && break
+                                sleep 1
+                            done
+            
+                            echo "Ejecutando tests REST..."
+                            PYTHONPATH=. ./venv/bin/pytest --junitxml=result-rest.xml test/rest
+            
+                            echo "Cerrando procesos..."
+                            kill $FLASK_PID || true
+                            kill $WIREMOCK_PID || true
+                        '''
+                        stash name: 'rest-results', includes: 'result-rest.xml, flask.log, wiremock.log'
+                        }
+                    }
+                }   
+            }
+        }
+        stage('Results') {
+            agent { label 'junit'}
+                steps {
+                    unstash 'unit-results'
+                    unstash 'rest-results'
+                    junit 'result*.xml'
+                }
+            }
+    }
+}
